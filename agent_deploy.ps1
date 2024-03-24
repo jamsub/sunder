@@ -3,7 +3,8 @@ param (
     [Parameter(Mandatory=$true)]
     [string]$enrollmentToken
 )
-
+mkdir $installDirectory
+cd $installDirectory
 $ProgressPreference = 'SilentlyContinue'
 
 # Define download URL for Elastic Agent
