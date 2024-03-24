@@ -3,6 +3,8 @@ param (
     [Parameter(Mandatory=$true)]
     [string]$enrollmentToken
 )
+# Define the directory where you want to install Elastic Agent
+$installDirectory = "C:\SUNDERAgent"
 mkdir $installDirectory
 cd $installDirectory
 $ProgressPreference = 'SilentlyContinue'
@@ -10,8 +12,7 @@ $ProgressPreference = 'SilentlyContinue'
 # Define download URL for Elastic Agent
 $downloadUrl = "https://artifacts.elastic.co/downloads/beats/elastic-agent/elastic-agent-8.12.2-windows-x86_64.zip"
 
-# Define the directory where you want to install Elastic Agent
-$installDirectory = "C:\SUNDERAgent"
+
 
 # Define your Elastic Stack URL
 $elasticStackURL = "https://865728532f2e49c5bfd2f987753d5c01.fleet.us-central1.gcp.cloud.es.io:443"
@@ -26,4 +27,4 @@ Expand-Archive -Path "$installDirectory\elastic-agent-8.12.2-windows-x86_64.zip"
 Set-Location -Path "$installDirectory\elastic-agent-8.12.2-windows-x86_64"
 
 # Install the Elastic Agent
-.\elastic-agent.exe install --url=$elasticStackURL --enrollment-token=$enrollmentToken
+.\elastic-agent.exe install -n --url=$elasticStackURL --enrollment-token=$enrollmentToken
