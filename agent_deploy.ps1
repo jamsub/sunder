@@ -37,7 +37,7 @@ if (Test-Path -Path $zipFilePath) {
     Set-Location -Path "$installDirectory\elastic-agent-8.12.2-windows-x86_64"
 
     # Install the Elastic Agent
-    .\elastic-agent.exe install --url=$elasticStackURL --enrollment-token=$enrollmentToken
+    .\elastic-agent.exe install -n --url=$elasticStackURL --enrollment-token=$enrollmentToken
 } else {
     Write-Host "Failed to download Elastic Agent zip file."
 }
