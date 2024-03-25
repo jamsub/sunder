@@ -10,8 +10,7 @@ if (!(Test-Path -Path $installDirectory -PathType Container)) {
     # If not exists, create the directory
     New-Item -ItemType Directory -Path $installDirectory
 }
-mkdir $installDirectory
-cd $installDirectory
+
 $ProgressPreference = 'SilentlyContinue'
 
 # Define download URL for Elastic Agent
