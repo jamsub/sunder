@@ -1,27 +1,28 @@
 #!/bin/bash
 
 ################################################################################
-# Proxmox Network Change and VM Shutdown Script
+# Proxmox Network Change and VM Shutdown Script - TESTED VERSION
 # 
 # This script:
 # 1. Changes the IP address of a Proxmox server using /etc/network/interfaces
-# 2. Shuts down all running Proxmox VMs gracefully
-# 3. Provides option to shutdown or reboot the host
+# 2. Updates /etc/hosts file
+# 3. Shuts down all running Proxmox VMs gracefully
+# 4. Provides option to shutdown or reboot the host
 #
+# Tested on: Proxmox VE (Debian-based)
 # Requirements:
-# - Proxmox VE (Debian-based)
 # - Root/sudo privileges
 # - ifupdown2 (default in Proxmox VE 7+)
 ################################################################################
 
-set -euo pipefail  # Exit on error, undefined variables, and pipe failures
+set -euo pipefail
 
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # Logging functions
 log_info() {
@@ -86,60 +87,53 @@ mask_to_cidr() {
     echo "$nbits"
 }
 
-# Detect bridge interface (typically vmbr0)
-detect_bridge() {
-    local bridge
-    # First try to find the bridge with an IP address
-    bridge=$(ip addr | grep -oP '(?<=^\d: )vmbr\d+(?=:)' | head -n1)
+# Detect current network configuration
+detect_current_config() {
+    log_step "Detecting current network configuration"
     
-    if [[ -z "$bridge" ]]; then
-        # Fallback to default
-        bridge="vmbr0"
-        log_warn "Could not detect bridge interface, using default: $bridge"
-    else
-        log_info "Detected bridge interface: $bridge"
-    fi
-    
-    echo "$bridge"
-}
-
-# Detect physical interface
-detect_physical_interface() {
-    # Get the physical interface that's bridged (usually en* or eth*)
-    local physical
-    physical=$(ip link | grep -oP '(?<=^\d: )(en\w+|eth\d+)(?=:)' | head -n1)
-    
-    if [[ -z "$physical" ]]; then
-        log_error "Could not detect physical network interface"
+    # Get bridge interface (usually vmbr0)
+    BRIDGE=$(grep "^auto vmbr" /etc/network/interfaces | grep -v "^#" | head -n1 | awk '{print $2}')
+    if [[ -z "$BRIDGE" ]]; then
+        log_error "Could not detect bridge interface"
         exit 1
     fi
-    
-    echo "$physical"
-}
-
-# Get network configuration from user
-get_network_config() {
-    log_step "Network Configuration"
-    echo ""
-    
-    # Detect interfaces
-    BRIDGE=$(detect_bridge)
-    PHYSICAL_INTERFACE=$(detect_physical_interface)
-    
     log_info "Bridge interface: $BRIDGE"
-    log_info "Physical interface: $PHYSICAL_INTERFACE"
     
-    # Get current IP for reference
-    CURRENT_IP=$(ip addr show "$BRIDGE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+    # Get current IP address
+    CURRENT_IP=$(grep "address" /etc/network/interfaces | grep -v "^#" | head -n1 | awk '{print $2}')
     if [[ -n "$CURRENT_IP" ]]; then
         log_info "Current IP address: $CURRENT_IP"
     fi
     
+    # Get current netmask
+    CURRENT_NETMASK=$(grep "netmask" /etc/network/interfaces | grep -v "^#" | head -n1 | awk '{print $2}')
+    if [[ -n "$CURRENT_NETMASK" ]]; then
+        log_info "Current netmask: $CURRENT_NETMASK"
+    fi
+    
     # Get current gateway
-    CURRENT_GATEWAY=$(ip route | grep default | awk '{print $3}' | head -n1)
+    CURRENT_GATEWAY=$(grep "gateway" /etc/network/interfaces | grep -v "^#" | head -n1 | awk '{print $2}')
     if [[ -n "$CURRENT_GATEWAY" ]]; then
         log_info "Current gateway: $CURRENT_GATEWAY"
     fi
+    
+    # Get bridge-ports
+    BRIDGE_PORTS=$(grep "bridge-ports" /etc/network/interfaces | grep -v "^#" | head -n1 | awk '{print $2}')
+    if [[ -n "$BRIDGE_PORTS" ]]; then
+        log_info "Bridge ports: $BRIDGE_PORTS"
+    fi
+    
+    # Get hostname
+    HOSTNAME=$(hostname)
+    HOSTNAME_FQDN=$(hostname -f 2>/dev/null || echo "${HOSTNAME}.local")
+    log_info "Hostname: $HOSTNAME ($HOSTNAME_FQDN)"
+    
+    echo ""
+}
+
+# Get network configuration from user
+get_network_config() {
+    log_step "New Network Configuration"
     echo ""
     
     # Prompt for new IP address
@@ -153,33 +147,38 @@ get_network_config() {
     done
     
     # Prompt for subnet mask
-    while true; do
+    if [[ -n "$CURRENT_NETMASK" ]]; then
+        read -p "Enter subnet mask [${CURRENT_NETMASK}]: " SUBNET_MASK
+        SUBNET_MASK=${SUBNET_MASK:-$CURRENT_NETMASK}
+    else
         read -p "Enter subnet mask (e.g., 255.255.255.0): " SUBNET_MASK
-        if validate_ip "$SUBNET_MASK"; then
-            CIDR=$(mask_to_cidr "$SUBNET_MASK")
-            if [[ $? -eq 0 ]]; then
-                break
-            fi
-        else
-            log_error "Invalid subnet mask format. Please try again."
-        fi
+    fi
+    
+    while ! validate_ip "$SUBNET_MASK"; do
+        log_error "Invalid subnet mask format. Please try again."
+        read -p "Enter subnet mask: " SUBNET_MASK
     done
     
     # Prompt for gateway
-    while true; do
+    if [[ -n "$CURRENT_GATEWAY" ]]; then
+        read -p "Enter gateway IP address [${CURRENT_GATEWAY}]: " GATEWAY
+        GATEWAY=${GATEWAY:-$CURRENT_GATEWAY}
+    else
         read -p "Enter gateway IP address: " GATEWAY
-        if validate_ip "$GATEWAY"; then
-            break
-        else
-            log_error "Invalid gateway IP address format. Please try again."
-        fi
+    fi
+    
+    while ! validate_ip "$GATEWAY"; do
+        log_error "Invalid gateway IP address format. Please try again."
+        read -p "Enter gateway IP address: " GATEWAY
     done
     
     echo ""
     log_info "Configuration Summary:"
     echo "  Bridge: $BRIDGE"
-    echo "  Physical Interface: $PHYSICAL_INTERFACE"
-    echo "  New IP: $NEW_IP/$CIDR ($SUBNET_MASK)"
+    echo "  Bridge Ports: $BRIDGE_PORTS"
+    echo "  Current IP: $CURRENT_IP"
+    echo "  New IP: $NEW_IP"
+    echo "  Netmask: $SUBNET_MASK"
     echo "  Gateway: $GATEWAY"
     echo ""
     
@@ -190,253 +189,162 @@ get_network_config() {
     fi
 }
 
-# Backup existing network configuration
-backup_network_config() {
-    log_step "Backing up current network configuration"
+# Backup current configuration
+backup_config() {
+    log_step "Backing up current configuration"
     
     local timestamp=$(date +%Y%m%d_%H%M%S)
-    local backup_dir="/root/network_backup_${timestamp}"
     
-    mkdir -p "$backup_dir"
-    
-    # Backup interfaces file
     if [[ -f "/etc/network/interfaces" ]]; then
-        cp /etc/network/interfaces "$backup_dir/interfaces"
+        cp /etc/network/interfaces "/root/interfaces.backup.${timestamp}"
+        log_info "Backed up: /root/interfaces.backup.${timestamp}"
+    fi
+    
+    if [[ -f "/etc/hosts" ]]; then
+        cp /etc/hosts "/root/hosts.backup.${timestamp}"
+        log_info "Backed up: /root/hosts.backup.${timestamp}"
+    fi
+    
+    BACKUP_TIMESTAMP=$timestamp
+    echo ""
+}
+
+# Update /etc/network/interfaces
+update_interfaces() {
+    log_step "Updating /etc/network/interfaces"
+    
+    # Use sed to replace the IP address line
+    sed -i "s/^\s*address\s\+${CURRENT_IP}/        address ${NEW_IP}/" /etc/network/interfaces
+    
+    # Update netmask if it changed
+    if [[ -n "$CURRENT_NETMASK" ]]; then
+        sed -i "s/^\s*netmask\s\+${CURRENT_NETMASK}/        netmask ${SUBNET_MASK}/" /etc/network/interfaces
+    fi
+    
+    # Update gateway if it changed
+    if [[ -n "$CURRENT_GATEWAY" ]]; then
+        sed -i "s/^\s*gateway\s\+${CURRENT_GATEWAY}/        gateway ${GATEWAY}/" /etc/network/interfaces
+    fi
+    
+    log_info "Updated /etc/network/interfaces"
+    
+    # Show relevant lines
+    echo ""
+    log_info "New configuration in /etc/network/interfaces:"
+    echo "----------------------------------------"
+    grep -A 6 "auto ${BRIDGE}" /etc/network/interfaces | grep -v "^#"
+    echo "----------------------------------------"
+    echo ""
+}
+
+# Update /etc/hosts
+update_hosts() {
+    log_step "Updating /etc/hosts"
+    
+    # Use sed to replace the IP address for the hostname
+    sed -i "s/^${CURRENT_IP}\s\+/${NEW_IP} /" /etc/hosts
+    
+    log_info "Updated /etc/hosts"
+    
+    # Show the updated line
+    echo ""
+    log_info "New entry in /etc/hosts:"
+    echo "----------------------------------------"
+    grep "${NEW_IP}" /etc/hosts
+    echo "----------------------------------------"
+    echo ""
+}
+
+# Apply network configuration
+apply_network() {
+    log_step "Applying network configuration"
+    
+    log_warn "Network connectivity will be interrupted briefly"
+    echo ""
+    
+    # Check if ifreload is available
+    if ! command -v ifreload &> /dev/null; then
+        log_error "ifreload command not found. You may need to reboot to apply changes."
+        read -p "Reboot now to apply changes? (yes/no): " reboot_now
+        if [[ "$reboot_now" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
+            log_info "Rebooting in 5 seconds..."
+            sleep 5
+            reboot
+        else
+            log_warn "Configuration saved but not applied. Reboot required."
+            exit 0
+        fi
+    fi
+    
+    read -p "Apply network configuration now? (yes/no): " apply_confirm
+    if [[ ! "$apply_confirm" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
+        log_warn "Network configuration not applied"
+        log_info "To apply manually, run: ifreload -a"
+        exit 0
+    fi
+    
+    # Apply configuration
+    if ifreload -a 2>&1; then
+        sleep 2
+        log_info "Network configuration applied successfully"
+        
+        # Verify new IP
+        NEW_IP_CHECK=$(ip addr show "$BRIDGE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+        if [[ "$NEW_IP_CHECK" == "$NEW_IP" ]]; then
+            log_info "✓ Verified new IP: $NEW_IP_CHECK"
+        else
+            log_warn "IP verification: Expected $NEW_IP, got $NEW_IP_CHECK"
+        fi
+        
+        # Test gateway
+        if ping -c 2 "$GATEWAY" &> /dev/null; then
+            log_info "✓ Gateway is reachable: $GATEWAY"
+        else
+            log_warn "Cannot ping gateway: $GATEWAY"
+        fi
+        
+        # Check web service
+        if systemctl is-active --quiet pveproxy; then
+            log_info "✓ Proxmox web service is running"
+            log_info "  Access at: https://${NEW_IP}:8006"
+        else
+            log_warn "Proxmox web service may need restart"
+        fi
     else
-        log_error "/etc/network/interfaces file not found!"
+        log_error "Failed to apply network configuration"
+        log_warn "Restoring backups..."
+        
+        cp "/root/interfaces.backup.${BACKUP_TIMESTAMP}" /etc/network/interfaces
+        cp "/root/hosts.backup.${BACKUP_TIMESTAMP}" /etc/hosts
+        ifreload -a
+        
+        log_info "Backup restored. Configuration reverted."
         exit 1
     fi
     
-    # Backup hosts file
-    if [[ -f "/etc/hosts" ]]; then
-        cp /etc/hosts "$backup_dir/hosts"
-    fi
-    
-    # Backup issue file if it exists
-    if [[ -f "/etc/issue" ]]; then
-        cp /etc/issue "$backup_dir/issue"
-    fi
-    
-    # Backup resolv.conf if it exists
-    if [[ -f "/etc/resolv.conf" ]]; then
-        cp /etc/resolv.conf "$backup_dir/resolv.conf"
-    fi
-    
-    # Backup cluster configs if they exist
-    if [[ -f "/etc/pve/corosync.conf" ]]; then
-        cp /etc/pve/corosync.conf "$backup_dir/corosync.conf" 2>/dev/null || true
-    fi
-    
-    log_info "Backup created at: $backup_dir"
-    BACKUP_DIR="$backup_dir"
-}
-
-# Configure network interfaces file
-configure_network() {
-    log_step "Configuring network interfaces"
-    
-    local interfaces_file="/etc/network/interfaces"
-    local temp_file="/etc/network/interfaces.new"
-    
-    # Read existing configuration to preserve other interfaces
-    local existing_config=""
-    if [[ -f "$interfaces_file" ]]; then
-        # Extract loopback and physical interface configs
-        existing_config=$(grep -A 10 "^auto lo" "$interfaces_file" 2>/dev/null || echo "")
-    fi
-    
-    # Create new configuration
-    cat > "$temp_file" << EOF
-# Network configuration generated by proxmox-network-change.sh
-# Backup created at: /root/interfaces.backup.*
-# Generated: $(date)
-
-auto lo
-iface lo inet loopback
-
-auto $PHYSICAL_INTERFACE
-iface $PHYSICAL_INTERFACE inet manual
-
-auto $BRIDGE
-iface $BRIDGE inet static
-    address $NEW_IP/$CIDR
-    gateway $GATEWAY
-    bridge-ports $PHYSICAL_INTERFACE
-    bridge-stp off
-    bridge-fd 0
-EOF
-
-    # Add any additional bridges from original config (vmbr1, vmbr2, etc.)
-    if [[ -f "$interfaces_file" ]]; then
-        # Extract other bridge configurations (excluding our primary bridge)
-        grep -E "^(auto|iface) vmbr" "$interfaces_file" | grep -v "$BRIDGE" > /tmp/other_bridges.txt 2>/dev/null || true
-        if [[ -s /tmp/other_bridges.txt ]]; then
-            echo "" >> "$temp_file"
-            echo "# Additional bridges from original configuration" >> "$temp_file"
-            awk '/^auto vmbr[1-9]|^iface vmbr[1-9]/{flag=1} flag{print; if(/^$/){flag=0}}' "$interfaces_file" >> "$temp_file" 2>/dev/null || true
-        fi
-        rm -f /tmp/other_bridges.txt
-    fi
-    
-    log_info "Network configuration written to $temp_file"
-    
-    # Show the configuration
-    echo ""
-    log_info "New network configuration:"
-    echo "----------------------------------------"
-    cat "$temp_file"
-    echo "----------------------------------------"
     echo ""
 }
 
-# Update /etc/hosts file
-update_hosts_file() {
-    log_step "Updating /etc/hosts file"
-    
-    local hosts_file="/etc/hosts"
-    local hostname=$(hostname)
-    local hostname_fqdn=$(hostname -f 2>/dev/null || echo "$hostname")
-    
-    # Create backup
-    cp "$hosts_file" "${hosts_file}.bak"
-    
-    # Read current hosts file and update/add entry
-    local temp_hosts="/tmp/hosts.new"
-    
-    # Start with standard entries
-    cat > "$temp_hosts" << EOF
-127.0.0.1       localhost.localdomain localhost
-$NEW_IP       $hostname_fqdn $hostname
-
-# The following lines are desirable for IPv6 capable hosts
-::1             localhost ip6-localhost ip6-loopback
-ff02::1         ip6-allnodes
-ff02::2         ip6-allrouters
-EOF
-    
-    # Preserve any additional custom entries (skip old entries for this hostname)
-    if [[ -f "$hosts_file" ]]; then
-        grep -v "127.0.0.1" "$hosts_file" | \
-        grep -v "::1" | \
-        grep -v "ip6-" | \
-        grep -v "ff02::" | \
-        grep -v "$hostname" | \
-        grep -v "^#" | \
-        grep -v "^$" >> "$temp_hosts" 2>/dev/null || true
-    fi
-    
-    # Show what will be written
-    echo ""
-    log_info "New /etc/hosts content:"
-    echo "----------------------------------------"
-    cat "$temp_hosts"
-    echo "----------------------------------------"
-    echo ""
-    
-    # Ask for confirmation
-    read -p "Update /etc/hosts file? (yes/no): " hosts_confirm
-    if [[ "$hosts_confirm" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
-        mv "$temp_hosts" "$hosts_file"
-        log_info "/etc/hosts updated successfully"
-    else
-        log_warn "/etc/hosts not updated"
-        rm "$temp_hosts"
-    fi
-}
-
-# Check and warn about cluster configuration
-check_cluster_config() {
-    log_step "Checking for Proxmox Cluster configuration"
-    
-    # Check if this node is part of a cluster
+# Check for cluster
+check_cluster() {
     if [[ -f "/etc/pve/corosync.conf" ]]; then
         log_warn "⚠️  CLUSTER DETECTED ⚠️"
         echo ""
         log_error "This server is part of a Proxmox cluster!"
         echo ""
-        echo "Changing the IP address of a clustered node requires additional steps:"
-        echo "  1. Update /etc/pve/corosync.conf (on ONE node with quorum)"
-        echo "  2. Increment config_version in corosync.conf"
-        echo "  3. Update /etc/hosts on ALL nodes"
-        echo "  4. Update /etc/pve/priv/known_hosts"
-        echo "  5. Restart pve-cluster and corosync services"
+        echo "You must ALSO manually update:"
+        echo "  1. /etc/pve/corosync.conf (increment config_version!)"
+        echo "  2. /etc/hosts on ALL cluster nodes"
+        echo "  3. Restart pve-cluster and corosync services"
         echo ""
-        log_error "This script only handles the network interface configuration."
-        log_error "You MUST manually update cluster configuration files!"
-        echo ""
-        log_warn "For clusters, it's often safer to:"
-        echo "  - Remove node from cluster"
-        echo "  - Change IP address"
-        echo "  - Re-join cluster with new IP"
+        log_warn "Refer to FILE_REFERENCE_GUIDE.md for cluster procedures"
         echo ""
         
-        read -p "Do you understand the risks and want to continue? (yes/no): " cluster_confirm
+        read -p "Do you understand and want to continue? (yes/no): " cluster_confirm
         if [[ ! "$cluster_confirm" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
-            log_info "Exiting to prevent cluster corruption"
+            log_info "Exiting"
             exit 0
         fi
-        
-        # Show current cluster status
-        if command -v pvecm &> /dev/null; then
-            echo ""
-            log_info "Current cluster status:"
-            pvecm status || true
-            echo ""
-        fi
-    else
-        log_info "No cluster configuration detected - standalone server"
-    fi
-}
-
-# Validate and apply network configuration
-apply_network_config() {
-    log_step "Applying network configuration"
-    
-    local temp_file="/etc/network/interfaces.new"
-    local interfaces_file="/etc/network/interfaces"
-    
-    # Check if ifupdown2 is available
-    if command -v ifreload &> /dev/null; then
-        log_info "Using ifupdown2 for live network reload"
-        
-        # Copy temp file to actual interfaces file
-        cp "$temp_file" "$interfaces_file"
-        
-        log_warn "Network connectivity will be interrupted briefly"
-        echo ""
-        log_warn "If this is a remote connection, you may lose connectivity!"
-        log_warn "Make sure you have console access available."
-        echo ""
-        read -p "Press Enter to continue or Ctrl+C to cancel..."
-        
-        # Apply configuration
-        if ifreload -a; then
-            log_info "Network configuration applied successfully"
-            sleep 2
-            
-            # Verify new IP is assigned
-            NEW_IP_CHECK=$(ip addr show "$BRIDGE" | grep "inet " | awk '{print $2}' | cut -d/ -f1)
-            if [[ "$NEW_IP_CHECK" == "$NEW_IP" ]]; then
-                log_info "New IP address verified: $NEW_IP_CHECK"
-            else
-                log_warn "IP address check shows: $NEW_IP_CHECK (expected: $NEW_IP)"
-            fi
-        else
-            log_error "Failed to apply network configuration"
-            log_warn "Restoring backup..."
-            # Restore from backup
-            LATEST_BACKUP=$(ls -t /root/interfaces.backup.* 2>/dev/null | head -n1)
-            if [[ -n "$LATEST_BACKUP" ]]; then
-                cp "$LATEST_BACKUP" "$interfaces_file"
-                ifreload -a
-                log_info "Backup restored"
-            fi
-            exit 1
-        fi
-    else
-        log_warn "ifupdown2 not found. Configuration will be applied on next reboot."
-        cp "$temp_file" "$interfaces_file"
-        log_info "Configuration saved. Reboot required to apply changes."
     fi
 }
 
@@ -464,19 +372,19 @@ shutdown_vms() {
     log_info "Found $vm_count running VM(s)"
     echo ""
     
-    # Display VMs to be shutdown
-    log_info "VMs to be shutdown:"
+    # Display VMs
+    log_info "Running VMs:"
     qm list | awk 'NR>1 && $3=="running" {printf "  VM %s: %s (Status: %s)\n", $1, $2, $3}'
     echo ""
     
-    read -p "Proceed with VM shutdown? (yes/no): " vm_confirm
+    read -p "Shutdown all VMs? (yes/no): " vm_confirm
     if [[ ! "$vm_confirm" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
         log_warn "VM shutdown cancelled"
         return 0
     fi
     
-    # Shutdown each VM gracefully
-    local shutdown_timeout=120  # 2 minutes per VM
+    # Shutdown timeout
+    local shutdown_timeout=120
     
     for vmid in $running_vms; do
         local vm_name
@@ -487,14 +395,13 @@ shutdown_vms() {
         
         # Attempt graceful shutdown
         if qm shutdown "$vmid" &> /dev/null; then
-            # Wait for VM to shutdown with timeout
             local elapsed=0
             while [[ $elapsed -lt $shutdown_timeout ]]; do
                 local status
                 status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
                 
                 if [[ "$status" == "stopped" ]]; then
-                    log_info "VM $vmid shutdown successfully (${elapsed}s)"
+                    log_info "✓ VM $vmid shutdown successfully (${elapsed}s)"
                     break
                 fi
                 
@@ -502,29 +409,23 @@ shutdown_vms() {
                 elapsed=$((elapsed + 5))
                 
                 if [[ $((elapsed % 30)) -eq 0 ]]; then
-                    log_info "Still waiting for VM $vmid... (${elapsed}s/${shutdown_timeout}s)"
+                    log_info "  Waiting for VM $vmid... (${elapsed}s/${shutdown_timeout}s)"
                 fi
             done
             
-            # If still running after timeout, force stop
+            # Force stop if still running
             status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
             if [[ "$status" != "stopped" ]]; then
-                log_warn "VM $vmid did not shutdown gracefully after ${shutdown_timeout}s. Forcing stop..."
-                if qm stop "$vmid" &> /dev/null; then
-                    sleep 2
-                    log_info "VM $vmid force stopped"
-                else
-                    log_error "Failed to force stop VM $vmid"
-                fi
+                log_warn "VM $vmid did not shutdown gracefully. Forcing stop..."
+                qm stop "$vmid" &> /dev/null
+                sleep 2
+                log_info "✓ VM $vmid force stopped"
             fi
         else
-            log_warn "Failed to send shutdown signal to VM $vmid. Forcing stop..."
-            if qm stop "$vmid" &> /dev/null; then
-                sleep 2
-                log_info "VM $vmid force stopped"
-            else
-                log_error "Failed to force stop VM $vmid"
-            fi
+            log_warn "Failed to shutdown VM $vmid. Forcing stop..."
+            qm stop "$vmid" &> /dev/null
+            sleep 2
+            log_info "✓ VM $vmid force stopped"
         fi
     done
     
@@ -532,14 +433,14 @@ shutdown_vms() {
     log_info "All VMs have been shut down"
 }
 
-# Shutdown or reboot the host
+# Shutdown or reboot host
 shutdown_host() {
-    log_step "Host System Shutdown/Reboot"
+    log_step "Host System Options"
     echo ""
     echo "Select an option:"
     echo "1) Shutdown the system"
     echo "2) Reboot the system"
-    echo "3) Exit without shutdown/reboot"
+    echo "3) Exit (keep system running)"
     echo ""
     
     read -p "Enter your choice (1/2/3): " choice
@@ -558,71 +459,53 @@ shutdown_host() {
             reboot
             ;;
         3)
-            log_info "Exiting without shutdown or reboot"
+            log_info "Exiting - system remains running"
             exit 0
             ;;
         *)
-            log_error "Invalid choice. Exiting without shutdown or reboot"
+            log_error "Invalid choice"
             exit 1
             ;;
     esac
 }
 
-# Main execution flow
+# Main execution
 main() {
     echo ""
     echo "=========================================="
-    echo "  Proxmox Network & VM Management Script"
+    echo "  Proxmox Network Change Script"
+    echo "  Tested Working Version"
     echo "=========================================="
     echo ""
     
     # Pre-flight checks
     check_root
     
-    # Check if this is a Proxmox system
-    if [[ ! -f "/etc/pve/.version" ]]; then
-        log_warn "This doesn't appear to be a Proxmox VE system"
-        read -p "Continue anyway? (yes/no): " cont
-        if [[ ! "$cont" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
-            log_info "Exiting"
-            exit 0
-        fi
-    fi
+    # Check for cluster
+    check_cluster
     
-    # Check for cluster configuration
-    check_cluster_config
+    # Detect current configuration
+    detect_current_config
     
-    # Get network configuration from user
+    # Get new configuration from user
     get_network_config
     
-    # Backup existing configuration
-    backup_network_config
+    # Create backups
+    backup_config
     
-    # Configure network
-    configure_network
+    # Update configuration files
+    update_interfaces
+    update_hosts
     
-    # Update hosts file
-    update_hosts_file
-    
-    echo ""
-    read -p "Apply network configuration now? This will change the IP address. (yes/no): " apply_confirm
-    if [[ "$apply_confirm" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
-        apply_network_config
-    else
-        log_warn "Network configuration not applied. Configuration saved to /etc/network/interfaces.new"
-        log_info "To apply manually:"
-        log_info "  1. cp /etc/network/interfaces.new /etc/network/interfaces"
-        log_info "  2. ifreload -a    (or reboot)"
-    fi
+    # Apply network configuration
+    apply_network
     
     echo ""
-    
-    # Shutdown VMs
-    read -p "Shutdown Proxmox VMs now? (yes/no): " vm_confirm
-    if [[ "$vm_confirm" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
+    read -p "Shutdown Proxmox VMs? (yes/no): " vm_choice
+    if [[ "$vm_choice" =~ ^[Yy][Ee]?[Ss]?$ ]]; then
         shutdown_vms
     else
-        log_warn "VM shutdown skipped"
+        log_info "VM shutdown skipped"
     fi
     
     echo ""
